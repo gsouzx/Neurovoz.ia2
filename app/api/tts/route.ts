@@ -31,7 +31,8 @@ export async function POST(req: NextRequest) {
     body: JSON.stringify({
       text: text.trim(),
       model_id: 'eleven_multilingual_v2',
-      voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+      optimize_streaming_latency: 3,
+      voice_settings: { stability: 0.4, similarity_boost: 0.8 },
     }),
   })
 
@@ -43,6 +44,6 @@ export async function POST(req: NextRequest) {
 
   const audio = await elevenRes.arrayBuffer()
   return new NextResponse(audio, {
-    headers: { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-cache' },
+    headers: { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store' },
   })
 }

@@ -236,63 +236,67 @@ export function useSpeech({
       recognitionRef.current = null
     }
 
-    // Mark as speaking so recognition onend doesn't auto-restart
     isSpeakingRef.current = true
 
     const sentences = text.match(/[^.!?]+[.!?]+/g) ?? [text]
 
-    for (const sentence of sentences) {
-      if (speakGenerationRef.current !== myGeneration) break
+    // Fetch a single sentence; returns blob URL or null on error
+    const fetchSentence = (sentence: string): Promise<string | null> => {
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 12000)
+      return fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: sentence.trim(), voiceKey: voiceKeyRef.current }),
+        signal: controller.signal,
+      })
+        .finally(() => clearTimeout(timeoutId))
+        .then((res) => {
+          if (!res.ok) throw new Error(`TTS ${res.status}`)
+          return res.blob()
+        })
+        .then((blob) => URL.createObjectURL(blob))
+        .catch((e) => { console.error('[TTS] erro pre-fetch:', e); return null })
+    }
 
-      try {
-        // 12-second timeout — ElevenLabs can be slow on cold start
-        const controller = new AbortController()
-        const timeoutId = setTimeout(() => controller.abort(), 12000)
+    // 1-ahead pipeline: fetch sentence N+1 while sentence N is playing
+    // Never more than 2 concurrent requests → respects ElevenLabs free-plan rate limit
+    let nextFetch: Promise<string | null> | null = sentences.length > 0 ? fetchSentence(sentences[0]) : null
+    let firstAudio = true
 
-        let res: Response
-        try {
-          res = await fetch('/api/tts', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: sentence.trim(), voiceKey: voiceKeyRef.current }),
-            signal: controller.signal,
-          })
-        } finally {
-          clearTimeout(timeoutId)
-        }
+    for (let i = 0; i < sentences.length; i++) {
+      if (speakGenerationRef.current !== myGeneration) { nextFetch = null; break }
 
-        if (!res!.ok) {
-          const errBody = await res!.text().catch(() => '(sem detalhe)')
-          console.error('[TTS] API error', res!.status, errBody)
-          break
-        }
+      const currentFetch = nextFetch ?? fetchSentence(sentences[i])
 
-        if (speakGenerationRef.current !== myGeneration) break
+      // Kick off the NEXT fetch immediately so it runs while we await & play current
+      nextFetch = i + 1 < sentences.length ? fetchSentence(sentences[i + 1]) : null
 
-        const blob = await res!.blob()
-        if (speakGenerationRef.current !== myGeneration) break
+      const url = await currentFetch
+      if (!url) break
+      if (speakGenerationRef.current !== myGeneration) { URL.revokeObjectURL(url); break }
 
-        const url = URL.createObjectURL(blob)
-        const audio = new Audio(url)
-        currentAudioRef.current = audio
-
-        // Only show "speaking" visuals once audio is actually ready to play
+      if (firstAudio) {
         setIsSpeaking(true)
         setWaveMode('speaking')
-
-        await new Promise<void>((resolve) => {
-          audio.onended = () => resolve()
-          audio.onerror = (e) => { console.error('[TTS] audio.onerror', e); resolve() }
-          audio.play().catch((e) => { console.error('[TTS] autoplay bloqueado', e); resolve() })
-        })
-
-        URL.revokeObjectURL(url)
-        if (currentAudioRef.current === audio) currentAudioRef.current = null
-      } catch (e) {
-        console.error('[TTS] erro na sentença:', e)
-        break
+        firstAudio = false
       }
+
+      const audio = new Audio(url)
+      currentAudioRef.current = audio
+
+      await new Promise<void>((resolve) => {
+        audio.onended = () => resolve()
+        audio.onerror = (e) => { console.error('[TTS] audio.onerror', e); resolve() }
+        audio.play().catch((e) => { console.error('[TTS] autoplay bloqueado', e); resolve() })
+      })
+
+      URL.revokeObjectURL(url)
+      if (currentAudioRef.current === audio) currentAudioRef.current = null
     }
+
+    // Revoke the pending pre-fetch if we broke early
+    if (nextFetch) nextFetch.then((url) => { if (url) URL.revokeObjectURL(url) }).catch(() => {})
 
     if (speakGenerationRef.current === myGeneration) {
       isSpeakingRef.current = false

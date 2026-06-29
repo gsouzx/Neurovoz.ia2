@@ -13,7 +13,7 @@ interface UseSpeechOptions {
 export interface UseSpeechReturn {
   startListening: () => Promise<void>
   stopListening: () => void
-  speak: (text: string) => void
+  speak: (text: string) => Promise<void>
   cancelSpeech: () => void
   waveMode: WaveMode
   transcript: string
@@ -36,6 +36,7 @@ export function useSpeech({
 
   // Stable refs — used inside event callbacks to avoid stale closures
   const isListeningRef = useRef(false)
+  const isSpeakingRef = useRef(false)
   const onTranscriptReadyRef = useRef(onTranscriptReady)
   onTranscriptReadyRef.current = onTranscriptReady
 
@@ -44,26 +45,29 @@ export function useSpeech({
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const accumulatedRef = useRef('')
 
+  // ElevenLabs TTS — generation counter handles cancellation cleanly
+  const speakGenerationRef = useRef(0)
+  const currentAudioRef = useRef<HTMLAudioElement | null>(null)
+
   // AudioContext for real mic amplitude
   const audioCtxRef = useRef<AudioContext | null>(null)
   const analyserRef = useRef<AnalyserNode | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const rafRef = useRef<number | null>(null)
 
-  // Pre-cached voices list
-  const voicesRef = useRef<SpeechSynthesisVoice[]>([])
-
   const isSupported =
     typeof window !== 'undefined' &&
     !!((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition)
 
-  // Pre-load voices on mount so speak() always has them ready
-  useEffect(() => {
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return
-    const load = () => { voicesRef.current = window.speechSynthesis.getVoices() }
-    load()
-    window.speechSynthesis.addEventListener('voiceschanged', load)
-    return () => window.speechSynthesis.removeEventListener('voiceschanged', load)
+  // ── Internal cancel helper (used in multiple places) ─────────────────────
+
+  const stopCurrentAudio = useCallback(() => {
+    speakGenerationRef.current++
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause()
+      currentAudioRef.current = null
+    }
+    isSpeakingRef.current = false
   }, [])
 
   // ── Audio amplitude analysis ──────────────────────────────────────────────
@@ -100,7 +104,7 @@ export function useSpeech({
         if (now - lastUpdate >= 66) { // ~15 fps — avoids re-render storm
           analyser.getByteFrequencyData(data)
           const avg = data.reduce((s, v) => s + v, 0) / data.length
-          setAmplitude(Math.min(1, avg / 70)) // ~70 = average speaking level
+          setAmplitude(Math.min(1, avg / 70))
           lastUpdate = now
         }
         rafRef.current = requestAnimationFrame(tick)
@@ -124,9 +128,9 @@ export function useSpeech({
     rec.maxAlternatives = 1
 
     rec.onresult = (e: any) => {
-      // Interrupt AI speech as soon as user starts talking
-      if (window.speechSynthesis?.speaking) {
-        window.speechSynthesis.cancel()
+      // Interrupt ElevenLabs speech as soon as user starts talking
+      if (isSpeakingRef.current) {
+        stopCurrentAudio()
         setIsSpeaking(false)
         setWaveMode('listening')
       }
@@ -171,7 +175,7 @@ export function useSpeech({
     }
 
     return rec
-  }, [lang, silenceTimeout, stopAudio])
+  }, [lang, silenceTimeout, stopAudio, stopCurrentAudio])
 
   // ── Public API ────────────────────────────────────────────────────────────
 
@@ -181,11 +185,9 @@ export function useSpeech({
       return
     }
 
-    // Cancel any ongoing synthesis
-    if (window.speechSynthesis?.speaking) {
-      window.speechSynthesis.cancel()
-      setIsSpeaking(false)
-    }
+    // Cancel any ongoing ElevenLabs speech
+    stopCurrentAudio()
+    setIsSpeaking(false)
 
     accumulatedRef.current = ''
     setTranscript('')
@@ -199,7 +201,7 @@ export function useSpeech({
     if (!rec) return
     recognitionRef.current = rec
     try { rec.start() } catch (_) {}
-  }, [isSupported, startAudio, createRecognition])
+  }, [isSupported, startAudio, createRecognition, stopCurrentAudio])
 
   const stopListening = useCallback(() => {
     if (silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null }
@@ -219,44 +221,73 @@ export function useSpeech({
     accumulatedRef.current = ''
   }, [stopAudio])
 
-  const speak = useCallback((text: string) => {
-    if (typeof window === 'undefined' || !('speechSynthesis' in window) || !text.trim()) return
+  const speak = useCallback(async (text: string) => {
+    if (!text.trim()) return
 
-    window.speechSynthesis.cancel()
+    // Cancel any ongoing speech (increment generation to abort prior loop)
+    stopCurrentAudio()
+    const myGeneration = speakGenerationRef.current
 
-    const utterance = new SpeechSynthesisUtterance(text)
-    utterance.lang = lang
-    utterance.rate = 1.0
-    utterance.pitch = 1.0
+    isSpeakingRef.current = true
+    setIsSpeaking(true)
+    setWaveMode('speaking')
 
-    const ptVoices = voicesRef.current.filter((v) => v.lang === lang || v.lang.startsWith('pt'))
-    const preferred =
-      ptVoices.find((v) => v.name.toLowerCase().includes('google')) ||
-      ptVoices.find((v) => v.name.toLowerCase().includes('female') || v.name.toLowerCase().includes('feminina')) ||
-      ptVoices[0] ||
-      null
-    if (preferred) utterance.voice = preferred
+    // Split into sentences for lower perceived latency
+    const sentences = text.match(/[^.!?]+[.!?]+/g) ?? [text]
 
-    utterance.onstart = () => { setIsSpeaking(true); setWaveMode('speaking') }
-    utterance.onend = () => { setIsSpeaking(false); setWaveMode(isListeningRef.current ? 'listening' : 'idle') }
-    utterance.onerror = () => { setIsSpeaking(false); setWaveMode(isListeningRef.current ? 'listening' : 'idle') }
+    for (const sentence of sentences) {
+      if (speakGenerationRef.current !== myGeneration) break
 
-    window.speechSynthesis.speak(utterance)
-  }, [lang])
+      try {
+        const res = await fetch('/api/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: sentence.trim() }),
+        })
+
+        if (!res.ok || speakGenerationRef.current !== myGeneration) break
+
+        const blob = await res.blob()
+        if (speakGenerationRef.current !== myGeneration) break
+
+        const url = URL.createObjectURL(blob)
+        const audio = new Audio(url)
+        currentAudioRef.current = audio
+
+        await new Promise<void>((resolve) => {
+          audio.onended = () => resolve()
+          audio.onerror = () => resolve()
+          audio.play().catch(() => resolve())
+        })
+
+        URL.revokeObjectURL(url)
+        if (currentAudioRef.current === audio) currentAudioRef.current = null
+      } catch {
+        break
+      }
+    }
+
+    // Only restore state when we're still the current generation
+    if (speakGenerationRef.current === myGeneration) {
+      isSpeakingRef.current = false
+      setIsSpeaking(false)
+      setWaveMode(isListeningRef.current ? 'listening' : 'idle')
+    }
+  }, [stopCurrentAudio])
 
   const cancelSpeech = useCallback(() => {
-    if (typeof window !== 'undefined') window.speechSynthesis?.cancel()
+    stopCurrentAudio()
     setIsSpeaking(false)
     setWaveMode(isListeningRef.current ? 'listening' : 'idle')
-  }, [])
+  }, [stopCurrentAudio])
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
       stopListening()
-      if (typeof window !== 'undefined') window.speechSynthesis?.cancel()
+      stopCurrentAudio()
     }
-  }, [stopListening])
+  }, [stopListening, stopCurrentAudio])
 
   return { startListening, stopListening, speak, cancelSpeech, waveMode, transcript, isListening, isSpeaking, amplitude, isSupported }
 }

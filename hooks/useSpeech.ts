@@ -7,6 +7,7 @@ export type WaveMode = 'idle' | 'listening' | 'speaking'
 interface UseSpeechOptions {
   lang?: string
   silenceTimeout?: number
+  voiceKey?: 'ana' | 'carlos'
   onTranscriptReady?: (text: string) => void
 }
 
@@ -26,6 +27,7 @@ export interface UseSpeechReturn {
 export function useSpeech({
   lang = 'pt-BR',
   silenceTimeout = 1500,
+  voiceKey = 'ana',
   onTranscriptReady,
 }: UseSpeechOptions = {}): UseSpeechReturn {
   const [isListening, setIsListening] = useState(false)
@@ -34,22 +36,24 @@ export function useSpeech({
   const [transcript, setTranscript] = useState('')
   const [amplitude, setAmplitude] = useState(0)
 
-  // Stable refs — used inside event callbacks to avoid stale closures
   const isListeningRef = useRef(false)
   const isSpeakingRef = useRef(false)
   const onTranscriptReadyRef = useRef(onTranscriptReady)
   onTranscriptReadyRef.current = onTranscriptReady
 
-  // Speech recognition
   const recognitionRef = useRef<any>(null)
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const accumulatedRef = useRef('')
 
-  // ElevenLabs TTS — generation counter handles cancellation cleanly
+  // Keep voiceKey stable in async callbacks
+  const voiceKeyRef = useRef(voiceKey)
+  voiceKeyRef.current = voiceKey
+
+  // Generation counter — incrementing cancels any in-flight speak() loop
   const speakGenerationRef = useRef(0)
   const currentAudioRef = useRef<HTMLAudioElement | null>(null)
 
-  // AudioContext for real mic amplitude
+  // AudioContext for mic amplitude visualisation
   const audioCtxRef = useRef<AudioContext | null>(null)
   const analyserRef = useRef<AnalyserNode | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
@@ -59,7 +63,7 @@ export function useSpeech({
     typeof window !== 'undefined' &&
     !!((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition)
 
-  // ── Internal cancel helper (used in multiple places) ─────────────────────
+  // ── Stop TTS audio (cancels in-flight speak loop via generation) ──────────
 
   const stopCurrentAudio = useCallback(() => {
     speakGenerationRef.current++
@@ -70,7 +74,7 @@ export function useSpeech({
     isSpeakingRef.current = false
   }, [])
 
-  // ── Audio amplitude analysis ──────────────────────────────────────────────
+  // ── Mic amplitude ─────────────────────────────────────────────────────────
 
   const stopAudio = useCallback(() => {
     if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null }
@@ -86,22 +90,18 @@ export function useSpeech({
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
       streamRef.current = stream
-
       const ctx = new (window.AudioContext || (window as any).webkitAudioContext)()
       audioCtxRef.current = ctx
-
       const analyser = ctx.createAnalyser()
       analyser.fftSize = 512
       analyser.smoothingTimeConstant = 0.8
       analyserRef.current = analyser
       ctx.createMediaStreamSource(stream).connect(analyser)
-
       const data = new Uint8Array(analyser.frequencyBinCount)
       let lastUpdate = 0
-
       const tick = () => {
         const now = performance.now()
-        if (now - lastUpdate >= 66) { // ~15 fps — avoids re-render storm
+        if (now - lastUpdate >= 66) {
           analyser.getByteFrequencyData(data)
           const avg = data.reduce((s, v) => s + v, 0) / data.length
           setAmplitude(Math.min(1, avg / 70))
@@ -111,11 +111,11 @@ export function useSpeech({
       }
       rafRef.current = requestAnimationFrame(tick)
     } catch {
-      // Mic permission denied — amplitude stays 0, voice still works
+      // Mic permission denied — amplitude stays 0
     }
   }, [])
 
-  // ── SpeechRecognition ─────────────────────────────────────────────────────
+  // ── Recognition factory ───────────────────────────────────────────────────
 
   const createRecognition = useCallback(() => {
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
@@ -128,24 +128,17 @@ export function useSpeech({
     rec.maxAlternatives = 1
 
     rec.onresult = (e: any) => {
-      // Interrupt ElevenLabs speech as soon as user starts talking
-      if (isSpeakingRef.current) {
-        stopCurrentAudio()
-        setIsSpeaking(false)
-        setWaveMode('listening')
-      }
-
       let finalText = ''
       for (let i = e.resultIndex; i < e.results.length; i++) {
         if (e.results[i].isFinal) finalText += e.results[i][0].transcript + ' '
       }
 
-      if (finalText.trim()) {
-        accumulatedRef.current += finalText
-        setTranscript(accumulatedRef.current.trim())
-      }
+      if (!finalText.trim()) return // ignore interim-only events — prevents ambient noise from resetting timer
 
-      // Reset silence timer on every result
+      accumulatedRef.current += finalText
+      setTranscript(accumulatedRef.current.trim())
+
+      // Reset timer only after confirmed speech (final result)
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current)
       silenceTimerRef.current = setTimeout(() => {
         const text = accumulatedRef.current.trim()
@@ -157,9 +150,9 @@ export function useSpeech({
       }, silenceTimeout)
     }
 
-    // Auto-restart to keep recognition alive (Chrome stops after ~60s or silence)
+    // Auto-restart ONLY if we're actively listening AND not currently speaking
     rec.onend = () => {
-      if (isListeningRef.current) {
+      if (isListeningRef.current && !isSpeakingRef.current) {
         try { rec.start() } catch (_) {}
       }
     }
@@ -171,11 +164,14 @@ export function useSpeech({
         setWaveMode('idle')
         stopAudio()
       }
-      // 'no-speech' and 'network' are recoverable via onend restart
     }
 
     return rec
-  }, [lang, silenceTimeout, stopAudio, stopCurrentAudio])
+  }, [lang, silenceTimeout, stopAudio])
+
+  // Stable ref so speak/cancelSpeech can access createRecognition without dep issues
+  const createRecognitionRef = useRef(createRecognition)
+  createRecognitionRef.current = createRecognition
 
   // ── Public API ────────────────────────────────────────────────────────────
 
@@ -185,9 +181,15 @@ export function useSpeech({
       return
     }
 
-    // Cancel any ongoing ElevenLabs speech
     stopCurrentAudio()
     setIsSpeaking(false)
+
+    // Stop any stale recognition before creating a fresh one
+    if (recognitionRef.current) {
+      recognitionRef.current.onend = null
+      try { recognitionRef.current.stop() } catch (_) {}
+      recognitionRef.current = null
+    }
 
     accumulatedRef.current = ''
     setTranscript('')
@@ -195,7 +197,7 @@ export function useSpeech({
     setIsListening(true)
     setWaveMode('listening')
 
-    startAudio() // non-blocking — amplitude is optional
+    startAudio()
 
     const rec = createRecognition()
     if (!rec) return
@@ -209,7 +211,7 @@ export function useSpeech({
     isListeningRef.current = false
 
     if (recognitionRef.current) {
-      recognitionRef.current.onend = null // prevent auto-restart
+      recognitionRef.current.onend = null
       try { recognitionRef.current.stop() } catch (_) {}
       recognitionRef.current = null
     }
@@ -224,54 +226,87 @@ export function useSpeech({
   const speak = useCallback(async (text: string) => {
     if (!text.trim()) return
 
-    // Cancel any ongoing speech (increment generation to abort prior loop)
     stopCurrentAudio()
     const myGeneration = speakGenerationRef.current
 
-    isSpeakingRef.current = true
-    setIsSpeaking(true)
-    setWaveMode('speaking')
+    // ── Stop recognition while AI speaks (prevents echo from mic picking up speakers) ──
+    if (recognitionRef.current) {
+      recognitionRef.current.onend = null
+      try { recognitionRef.current.stop() } catch (_) {}
+      recognitionRef.current = null
+    }
 
-    // Split into sentences for lower perceived latency
+    // Mark as speaking so recognition onend doesn't auto-restart
+    isSpeakingRef.current = true
+
     const sentences = text.match(/[^.!?]+[.!?]+/g) ?? [text]
 
     for (const sentence of sentences) {
       if (speakGenerationRef.current !== myGeneration) break
 
       try {
-        const res = await fetch('/api/tts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: sentence.trim() }),
-        })
+        // 12-second timeout — ElevenLabs can be slow on cold start
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), 12000)
 
-        if (!res.ok || speakGenerationRef.current !== myGeneration) break
+        let res: Response
+        try {
+          res = await fetch('/api/tts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: sentence.trim(), voiceKey: voiceKeyRef.current }),
+            signal: controller.signal,
+          })
+        } finally {
+          clearTimeout(timeoutId)
+        }
 
-        const blob = await res.blob()
+        if (!res!.ok) {
+          const errBody = await res!.text().catch(() => '(sem detalhe)')
+          console.error('[TTS] API error', res!.status, errBody)
+          break
+        }
+
+        if (speakGenerationRef.current !== myGeneration) break
+
+        const blob = await res!.blob()
         if (speakGenerationRef.current !== myGeneration) break
 
         const url = URL.createObjectURL(blob)
         const audio = new Audio(url)
         currentAudioRef.current = audio
 
+        // Only show "speaking" visuals once audio is actually ready to play
+        setIsSpeaking(true)
+        setWaveMode('speaking')
+
         await new Promise<void>((resolve) => {
           audio.onended = () => resolve()
-          audio.onerror = () => resolve()
-          audio.play().catch(() => resolve())
+          audio.onerror = (e) => { console.error('[TTS] audio.onerror', e); resolve() }
+          audio.play().catch((e) => { console.error('[TTS] autoplay bloqueado', e); resolve() })
         })
 
         URL.revokeObjectURL(url)
         if (currentAudioRef.current === audio) currentAudioRef.current = null
-      } catch {
+      } catch (e) {
+        console.error('[TTS] erro na sentença:', e)
         break
       }
     }
 
-    // Only restore state when we're still the current generation
     if (speakGenerationRef.current === myGeneration) {
       isSpeakingRef.current = false
       setIsSpeaking(false)
       setWaveMode(isListeningRef.current ? 'listening' : 'idle')
+
+      // ── Resume recognition now that AI finished speaking ──
+      if (isListeningRef.current) {
+        const rec = createRecognitionRef.current()
+        if (rec) {
+          recognitionRef.current = rec
+          try { rec.start() } catch (_) {}
+        }
+      }
     }
   }, [stopCurrentAudio])
 
@@ -279,9 +314,17 @@ export function useSpeech({
     stopCurrentAudio()
     setIsSpeaking(false)
     setWaveMode(isListeningRef.current ? 'listening' : 'idle')
+
+    // Resume recognition if it was paused for TTS
+    if (isListeningRef.current && !recognitionRef.current) {
+      const rec = createRecognitionRef.current()
+      if (rec) {
+        recognitionRef.current = rec
+        try { rec.start() } catch (_) {}
+      }
+    }
   }, [stopCurrentAudio])
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
       stopListening()

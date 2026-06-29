@@ -219,7 +219,10 @@ export default function ChatPage() {
   const voiceSendRef = useRef<(text: string) => void>(() => {})
 
   const { startListening, stopListening, speak, cancelSpeech, waveMode, amplitude, transcript, isListening, isSpeaking, isSupported } =
-    useSpeech({ onTranscriptReady: (text) => voiceSendRef.current(text) })
+    useSpeech({
+      voiceKey: sessionVoiceIndex === 0 ? 'ana' : 'carlos',
+      onTranscriptReady: (text) => voiceSendRef.current(text),
+    })
 
   // Keep voiceSendRef always pointing to the latest implementation
   voiceSendRef.current = async (text: string) => {

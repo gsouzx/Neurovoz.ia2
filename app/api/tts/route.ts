@@ -1,9 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server'
 
-const VOICE_ID = '21m00Tcm4TlvDq8ikWAM' // Rachel — natural PT-BR
+// Premade voices — free on all ElevenLabs plans
+const VOICES: Record<string, string> = {
+  ana:    'EXAVITQu4vr4xnSDxMaL', // Sarah  — female, warm, multilingual
+  carlos: 'nPczCjzI2devNBz1zQrb', // Brian  — male,   deep, multilingual
+}
+const DEFAULT_VOICE = VOICES.ana
 
 export async function POST(req: NextRequest) {
-  const { text } = await req.json()
+  const { text, voiceKey } = await req.json()
 
   if (!text?.trim()) {
     return NextResponse.json({ error: 'text is required' }, { status: 400 })
@@ -14,7 +19,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'ELEVENLABS_API_KEY not configured' }, { status: 500 })
   }
 
-  const elevenRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`, {
+  const voiceId = VOICES[voiceKey as string] ?? DEFAULT_VOICE
+
+  const elevenRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
     method: 'POST',
     headers: {
       'xi-api-key': apiKey,
@@ -30,6 +37,7 @@ export async function POST(req: NextRequest) {
 
   if (!elevenRes.ok) {
     const detail = await elevenRes.text()
+    console.error('[ElevenLabs]', elevenRes.status, detail)
     return NextResponse.json({ error: detail }, { status: elevenRes.status })
   }
 
